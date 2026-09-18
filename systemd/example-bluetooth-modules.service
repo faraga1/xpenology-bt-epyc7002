@@ -1,0 +1,13 @@
+[Unit]
+Description=Load out-of-tree Bluetooth kernel modules (DSM guest kernel has none)
+DefaultDependencies=no
+Before=docker.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/volume2/docker/bt-modules/load-modules.sh
+
+[Install]
+WantedBy=multi-user.target
