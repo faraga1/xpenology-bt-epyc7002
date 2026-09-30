@@ -1,183 +1,200 @@
-# Bluetooth on Xpenology/Arc DSM 7.4.1 (AuxXxilium, epyc7002 platform)
+# Bluetooth on Xpenology/Arc DSM 7.4.1 (epyc7002, kernel 5.10.55+)
 
-How to get real Bluetooth kernel support (`hci0`, working `btusb`) inside
-a **Xpenology/Arc Loader** DSM 7.4.1 VM — where Synology's own build has
-`CONFIG_BT` disabled and no Bluetooth kernel modules exist anywhere on the
-filesystem — by cross-compiling the missing modules as out-of-tree
-`.ko` files against the *actual* kernel this platform runs, and loading
-them at boot.
+How to get working Bluetooth (`hci0`, `btusb`, BlueZ on top) on an
+Xpenology/Arc Loader DSM VM. Neither Synology's nor AuxXxilium's kernel
+config enables `CONFIG_BT`, and no Bluetooth modules exist anywhere on the
+system. The fix is to build them out of tree against the exact kernel, and
+load them.
 
-Confirmed working: `hci0` comes up, a USB Bluetooth dongle passed through
-from the Proxmox host is recognized, and a real BLE GATT session
-(`bluetoothd` + a Python `bleak` client) runs against it — see
-[xiaomi-scale-s200-ble](https://github.com/faraga1/xiaomi-scale-s200-ble)
-for what this was actually built for.
+**Status (September 2026):**
+- **Build:** `build-modules.sh` reproduces the modules exactly. A rebuild
+  matched the `srcversion` of all eight versioned modules, the compiled-in
+  features, the vermagic and the USB id table of the set running on the box.
+- **Real use:** since September 18 the modules have been driving a TP-Link
+  UB500 dongle passed through from Proxmox. A BlueZ + `bleak` client reads
+  a BLE scale with them (see
+  [xiaomi-scale-s200-ble](https://github.com/faraga1/xiaomi-scale-s200-ble)).
+- **Loading at boot:** verified from a container. The host systemd approach
+  is **untested** (see [Loading the modules at boot](#loading-the-modules-at-boot)).
 
-## Why this isn't as simple as `apt install bluez` or a DSM package
-
-Bluetooth support has two independent layers, and DSM's own package
-manager only ever gives you the second one:
-
-1. **Kernel-level**: the `bluetooth`/`btusb`/etc. kernel modules, which
-   have to be compiled *for the exact running kernel* (module ABI is
-   version- and config-sensitive — there's no "generic" `.ko`).
-2. **Userspace**: `bluez`/`bluetoothd`, D-Bus, etc. — this part is normal
-   and installable the usual way (or, as here, just run inside a
-   container that carries its own).
-
-DSM never ships the kernel-level piece on this platform, and there is no
-Control Panel toggle or package that adds it, because it was never built
-in to begin with.
-
-## Step 1: find out what kernel you're actually running
-
-This matters more than it sounds. On this box, `/proc/version` and the
-sheer number of extra third-party `.ko` files present (~670, which no
-stock Synology image ships) revealed that **the running kernel is not
-actually Synology's own build** — it's a custom kernel built by
-**AuxXxilium** (the maintainer of the Arc Loader used to boot DSM under
-Xpenology on non-Synology hardware). This is an important distinction:
-Synology's *and* AuxXxilium's own published kernel `.config` both have
-`CONFIG_BT` disabled, so Bluetooth was never compiled in by either party
-— but knowing exactly which kernel and toolchain you're dealing with is
-what makes cross-compiling against it *possible* rather than a guessing
-game.
-
-Identify yours the same way:
+## Quick start
 
 ```bash
-cat /proc/version
-ls -1 /lib/modules/$(uname -r)/ 2>/dev/null | wc -l   # stock Synology ships far fewer .ko files
-uname -r                                                # note the exact vermagic string, e.g. 5.10.55+
+# 1. build (needs Docker, ~10 GB for the toolkit image; fine to run on DSM itself)
+DOCKER="sudo docker" ./build-modules.sh          # -> out/*.ko
+
+# 2. check they're for your kernel
+uname -r                                          # 5.10.55+
+modinfo -F vermagic out/bluetooth.ko              # 5.10.55+ SMP mod_unload
+
+# 3. load
+sudo ./load-modules.sh out
+ls /sys/class/bluetooth                           # hci0, once an adapter is attached
 ```
 
-## Step 2: the toolchain
+Then make them load at every boot; see below.
 
-Kernel modules must be compiled with a toolchain that matches the exact
-kernel the target actually runs — not the generic Synology DSM Toolkit,
-which targets Synology's own stock kernel, not AuxXxilium's fork of it.
-AuxXxilium publishes a matching build container image for exactly this
-purpose:
+## Why DSM needs this
 
-```
-auxxxilium/syno-compiler:7.4
-```
+Bluetooth has two layers:
 
-Run it against AuxXxilium's own kernel source tree for your platform
-(this NAS: `epyc7002`) to get a build environment whose headers/config
-actually match what's running.
+1. **Kernel:** `bluetooth.ko`, `btusb.ko` and friends. These must be
+   compiled for the exact running kernel. There's no generic `.ko`.
+2. **Userspace:** `bluetoothd`, D-Bus. Normal, installable, or simply run
+   inside a container that brings its own.
 
-## Step 3: which modules, and in what order
+DSM ships neither, and there's no package or setting that adds the kernel
+part: `CONFIG_BT` was never enabled when the kernel was built. That also
+means the kernel's ECDH crypto module is missing, which Bluetooth needs.
 
-`CONFIG_BT` being disabled means the *entire* Bluetooth subsystem is
-missing, not just the USB driver — including its ECDH crypto dependency
-(`CONFIG_CRYPTO_ECDH` is also off). Build and load these, strictly in
-this order (`load-modules.sh` in this repo encodes it):
-
-```
-ecc.ko             -- ECC primitives, needed by ecdh_generic
-ecdh_generic.ko     -- CONFIG_CRYPTO_ECDH's module form
-bluetooth.ko        -- core net/bluetooth subsystem
-btintel.ko          -- (only if relevant to your adapter's chipset)
-btbcm.ko
-btrtl.ko
-btusb.ko             -- the actual USB HCI driver
-bnep.ko              -- Bluetooth PAN
-hidp.ko              -- Bluetooth HID
-rfcomm.ko            -- Bluetooth serial
-```
-
-Dependency chain: `ecc → ecdh_generic → bluetooth → {btintel,btbcm,btrtl}
-→ btusb`, and separately `bluetooth → {bnep,hidp,rfcomm}`. `btintel`/
-`btbcm`/`btrtl` are vendor-specific chipset quirks-and-firmware-loading
-modules for Intel/Broadcom/Realtek adapters respectively; a generic USB
-dongle (this was verified with a TP-Link UB500) mostly just needs
-`btusb`, but building all three is cheap and avoids guessing which one a
-given adapter's chipset actually wants.
-
-**Every module must vermagic-match your exact running kernel** (see Step
-1) — `modinfo <module>.ko | grep vermagic` — or the kernel will refuse to
-load it.
-
-## Step 4: load them safely
-
-**Never use `insmod -f` / `modprobe --force-vermagic`.** A vermagic
-mismatch means the module was built for the wrong kernel; forcing it past
-that check risks a kernel panic on a production VM, not a clean failure.
-If a plain `insmod` rejects a module, that's the kernel correctly telling
-you something is actually wrong (wrong kernel version, missing
-dependency) — fix the real cause, don't bypass the check.
+## Step 1: know your kernel
 
 ```bash
-sudo ./load-modules.sh
-dmesg -T | tail -30      # confirm each module loaded cleanly, check for hci0
-hciconfig -a              # or: bluetoothctl list
+cat /proc/version      # Linux version 5.10.55+ (AuxXxilium@Xpenology) ...
+uname -r               # 5.10.55+
+ls /lib/modules | wc -l   # DSM keeps .ko files directly in /lib/modules (no $(uname -r)/ subdir)
 ```
 
-`net/bluetooth` and `drivers/bluetooth` are mature, heavily-used mainline
-kernel subsystems — this is a fundamentally lower-risk kind of module
-load than, say, a GPU driver's probe path, but treat every `insmod` on a
-live system deliberately regardless: load one module, check `dmesg`,
-then move to the next.
+On this box the kernel is AuxXxilium's build for the Arc Loader, not
+Synology's own. Arc also ships ~670 extra modules. Its version string and
+configuration match Synology's epyc7002 kernel closely enough that modules
+built against Synology's epyc7002 build tree load and run fine, as long as
+the vermagic (`5.10.55+ SMP mod_unload`) matches.
 
-## Step 5: boot persistence
+**Only the vermagic is checked.** These kernels are built without
+`CONFIG_MODVERSIONS`, so there are no per-symbol checksums. A loader update
+that ships a rebuilt `5.10.55+` kernel with a different configuration would
+still accept old modules, even if the internals they rely on changed.
+**Rebuild the modules after any Arc loader/kernel update.** The build takes
+a couple of minutes.
 
-These modules live outside `/lib/modules` (DSM's own module tree is
-read-only/managed) and need to be reloaded on every boot. A oneshot
-systemd unit that runs before `docker.service` (so any container
-depending on the adapter, e.g. one running `bluetoothd` itself, starts
-after Bluetooth is actually up) is the simplest fit — see
-`systemd/example-bluetooth-modules.service` in this repo for a template.
-Enable it with `systemctl enable`.
+## Step 2: build — `build-modules.sh`
 
-## Step 6: getting a physical adapter to the VM
+What it does:
 
-If DSM itself runs as a Proxmox VM guest (as here), the adapter needs to
-be passed through at the VM level, not just present on the Proxmox host:
+- **Toolchain and kernel tree:** AuxXxilium's
+  [`auxxxilium/syno-compiler:7.4`](https://github.com/AuxXxilium/syno-compiler)
+  image. It contains Synology's epyc7002 kernel build tree (`.config`,
+  headers, `Module.symvers`, prebuilt build tools) and the matching GCC 12
+  cross toolchain.
+- **Sources:** the build tree has no Bluetooth sources, so they come from
+  upstream Linux **5.10.55** (kernel.org, checksum-verified). Only
+  `net/bluetooth`, `drivers/bluetooth` and the ECC/ECDH files from
+  `crypto/` are used.
+- **Config:** the kernel's own config is left untouched, because
+  regenerating it would also change the headers every module shares with
+  the running kernel. The Bluetooth options are instead passed to this build
+  only, in two forms: as make variables for the Makefiles, and as `-D`
+  defines for the `IS_ENABLED()`/`#ifdef` checks in the code. That's the
+  same mechanism the image's own `compile-module` command uses. The options
+  mirror the upstream defaults, plus Realtek/Broadcom/MediaTek support in
+  `btusb`:
+  - `m`: `BT`, `BT_RFCOMM`, `BT_BNEP`, `BT_HIDP`, `BT_HCIBTUSB`,
+    `BT_INTEL`, `BT_BCM`, `BT_RTL`, `CRYPTO_ECC`, `CRYPTO_ECDH`
+  - `y`: `BT_BREDR`, `BT_LE`, `BT_HS`, `BT_DEBUGFS`, `BT_RFCOMM_TTY`,
+    `BT_BNEP_MC_FILTER`, `BT_BNEP_PROTO_FILTER`, `BT_HCIBTUSB_BCM`,
+    `BT_HCIBTUSB_RTL`, `BT_HCIBTUSB_MTK`
+- **Output:** 10 modules in `out/`, debug info stripped (~1.4 MB in total).
+
+**Other 5.10.55 platforms** in the same image (`geminilakenk`, `v1000nk`,
+`r1000nk`, `epyc7003`...) should work with `PLATFORM=<name>`, but that's
+untested. Platforms on kernel 4.4 need 4.4 sources and different options.
+
+## Step 3: load order
+
+```
+ecc -> ecdh_generic -> bluetooth -> btintel, btbcm, btrtl -> btusb
+                       bluetooth -> bnep, hidp, rfcomm
+```
+
+`load-modules.sh` loads them in this order and skips any already loaded.
+For BLE only, `bnep`/`hidp`/`rfcomm` aren't needed (they're for Classic
+networking, input devices and serial), but they're cheap to load.
+
+**Never use `insmod -f` / `modprobe --force-vermagic`.** A refused module
+was built for a different kernel; forcing it in risks a kernel panic instead
+of a clean error. Load one module at a time and check `dmesg` if anything is
+off. The first unsigned, out-of-tree module after a boot makes the kernel log
+that it's now tainted; that's expected.
+
+## Loading the modules at boot
+
+DSM's own module directory is managed by the system, so these modules live
+on a data volume and have to be loaded again after every boot.
+
+**Verified: load them from the container that uses Bluetooth.** If whatever
+needs Bluetooth runs in Docker anyway (e.g. a BlueZ + client container with
+`--net=host --privileged`), let its entrypoint load the modules when `hci0`
+is missing. Mount the module directory read-only, and add `kmod` to the
+image. The container only starts once Docker and the data volumes are up,
+so there's nothing to order at boot. This was tested by unloading every
+Bluetooth module and restarting the container: it loaded all ten and
+`hci0` came back.
+
+```sh
+# in the entrypoint, before starting bluetoothd; /bt-modules is the mounted module dir
+if [ ! -e /sys/class/bluetooth/hci0 ]; then
+  for m in ecc ecdh_generic bluetooth btintel btbcm btrtl btusb bnep hidp rfcomm; do
+    grep -q "^$m " /proc/modules || insmod /bt-modules/$m.ko
+  done
+fi
+```
+
+A complete example is the `entrypoint.sh` in
+[xiaomi-scale-s200-ble](https://github.com/faraga1/xiaomi-scale-s200-ble).
+
+**Untested: a host systemd unit** (`systemd/example-bluetooth-modules.service`).
+The first version of this repo shipped a unit that couldn't have worked
+reliably. It ordered itself before `docker.service`, a unit that doesn't
+exist on DSM 7.4 (Docker is `pkg-ContainerManager-dockerd.service`). It
+also didn't wait for the volume its script lives on. And because the box
+hadn't rebooted since, it had never actually run. The example now waits
+for the volume with `RequiresMountsFor=` (`/volumeN` is in `/etc/fstab` on
+DSM 7.4, so systemd has a mount unit for it) and orders itself before the
+real Docker unit. It still hasn't been through a reboot, and DSM updates
+may not preserve files in `/etc/systemd/system`.
+
+## Getting the adapter to the VM (Proxmox)
 
 ```bash
-# on the Proxmox host, find the adapter:
-lsusb   # note vendor:product, e.g. 2357:0604 for a TP-Link UB500
-
-# attach it to the running VM (adjust the VM id and usbN slot):
-qm set <vmid> -usb1 host=2357:0604
+lsusb                                   # on the Proxmox host; TP-Link UB500 = 2357:0604
+qm set <vmid> -usb1 host=2357:0604      # use a free usbN slot
 ```
 
-Proxmox's own kernel needs no patching for this — Bluetooth support on
-the *host* side is normal, mainline, and already present; it's only the
-DSM *guest* kernel that lacks it, which is what steps 1–5 above address.
+**Firmware: this only works thanks to the Proxmox host.** The UB500 is a
+Realtek RTL8761BU. On the DSM side, two things are missing:
 
-This is a real, if minor, change to a live VM's hardware configuration —
-treat it with the same care as any other production VM edit (know how to
-reverse it, confirm before applying it if anyone else depends on that
-VM).
+- kernel 5.10's `btusb` doesn't list the UB500's USB id as Realtek (that was
+  added in a later kernel), so it never runs the Realtek setup;
+- DSM has no `rtl_bt/` firmware anyway.
 
-## Prior art / cross-references
+The dongle still runs Realtek's patched firmware. Proxmox's own kernel
+uploads `rtl_bt/rtl8761bu_fw.bin` when it first binds the dongle at boot,
+and the dongle keeps it when the VM takes it over. You can check this in
+the guest:
 
-- [kcsoft/synology-bluetooth](https://github.com/kcsoft/synology-bluetooth)
-  — the same general technique (out-of-tree Bluetooth module build for a
-  Synology-derived kernel that ships without `CONFIG_BT`), documented for
-  a different platform/kernel version. Useful as a sanity check that this
-  approach is sound and precedented, not a novel risk.
-- [AuxXxilium/arc](https://github.com/AuxXxilium/arc) — the Arc Loader
-  project itself, and the source of the `syno-compiler` build image and
-  kernel source used here.
+```bash
+hciconfig hci0 version    # Revision: 0xdfc6, Subversion: 0xd922  = patched fw 0xdfc6d922
+                          # Subversion 0x8761 would mean bare ROM firmware
+```
 
-## What's in this repo
+On bare-metal Xpenology, or if the host never binds the dongle before the VM
+starts, the dongle would run its ROM firmware. That's untested, and
+Realtek's ROM firmware is generally less reliable. The fix would be adding
+the UB500's id to `btusb` with `BTUSB_REALTEK`, and providing the firmware
+file.
 
-- `load-modules.sh` — the actual, verified-working load script for this
-  platform (epyc7002, DSM 7.4.1, AuxXxilium kernel vermagic
-  `5.10.55+ SMP mod_unload`). Load order and module list are exactly as
-  used; adjust vermagic/paths for your own kernel.
-- `systemd/example-bluetooth-modules.service` — a template boot-time unit
-  based on the one actually used, generalized (paths/names are
-  placeholders — this file is illustrative, not lifted verbatim from a
-  live system).
+## Files
 
-**Not included**: the exact original build script/Dockerfile used inside
-`syno-compiler` for this specific run — it wasn't preserved after the
-build session that produced the `.ko` files ended. Steps 2–3 above
-describe the real, verified toolchain/module list/dependency order that
-worked; reconstructing an exact one-shot build script from them (rather
-than running the compiler interactively) is a reasonable follow-up if
-that's useful to you — a PR with one is welcome.
+- `build-modules.sh`: reproducible build (see Step 2).
+- `load-modules.sh`: loads the modules in order: `sudo ./load-modules.sh <dir>`.
+- `systemd/example-bluetooth-modules.service`: boot-time unit, **untested**
+  (see above).
+
+## Prior art
+
+- [kcsoft/synology-bluetooth](https://github.com/kcsoft/synology-bluetooth):
+  the same technique for Synology's DSM 7.1/7.2 kernels (4.4, geminilake).
+- [AuxXxilium/syno-compiler](https://github.com/AuxXxilium/syno-compiler) and
+  [AuxXxilium/arc](https://github.com/AuxXxilium/arc): the toolkit image and
+  the loader.
