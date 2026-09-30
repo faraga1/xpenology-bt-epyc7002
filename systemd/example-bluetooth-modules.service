@@ -1,13 +1,20 @@
+# UNTESTED on a real reboot -- see README.md, "Loading the modules at boot".
+# Loading the modules from the container that needs Bluetooth is the
+# verified alternative.
+#
+# Adjust the paths to wherever load-modules.sh and the .ko files live.
+# RequiresMountsFor= waits for that volume: on DSM 7.4 /volumeN is in
+# /etc/fstab, so systemd has a mount unit for it. Docker on DSM 7.4 is
+# pkg-ContainerManager-dockerd.service -- there is no docker.service.
 [Unit]
-Description=Load out-of-tree Bluetooth kernel modules (DSM guest kernel has none)
-DefaultDependencies=no
-Before=docker.service
-After=local-fs.target
+Description=Load out-of-tree Bluetooth kernel modules (DSM ships none)
+RequiresMountsFor=/volume1/bt-modules
+Before=pkg-ContainerManager-dockerd.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/volume2/docker/bt-modules/load-modules.sh
+ExecStart=/volume1/bt-modules/load-modules.sh /volume1/bt-modules/out
 
 [Install]
 WantedBy=multi-user.target

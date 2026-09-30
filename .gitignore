@@ -1,0 +1,3 @@
+# build-modules.sh output: the kernel tarball, generated build script, modules
+work/
+out/
